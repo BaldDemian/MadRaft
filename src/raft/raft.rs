@@ -40,9 +40,10 @@ pub enum ApplyMsg {
 const INVALID_X_TERM: u64 = 0;
 const INVALID_X_INDEX: u64 = 0;
 
-const ELECTION_TIMEOUT_MIN_DURATION_MILLIS: u64 = 250;
+const ELECTION_TIMEOUT_MIN_DURATION_MILLIS: u64 = 200;
 const ELECTION_TIMEOUT_MAX_DURATION_MILLIS: u64 = 400;
-const APPEND_ENTRIES_INTERVAL: Duration = Duration::from_millis(60);
+const APPEND_ENTRIES_INTERVAL: Duration = Duration::from_millis(100);
+const RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 // log entry struct
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,12 +154,12 @@ impl RaftHandle {
         task::spawn(async move {
             handle_clone.append_entries_ticker().await;
         })
-            .detach();
+        .detach();
         let handle_clone = handle.clone();
         task::spawn(async move {
             handle_clone.election_ticker().await;
         })
-            .detach();
+        .detach();
         (handle, recver)
     }
 
@@ -172,7 +173,6 @@ impl RaftHandle {
     pub async fn start(&self, cmd: &[u8]) -> Result<Start> {
         let res = {
             let mut raft = self.inner.lock().unwrap();
-            info!("{:?} start", *raft);
             raft.start(cmd)
         };
         self.persist().await.expect("failed to persist");
@@ -323,7 +323,7 @@ impl RaftHandle {
                         .send_vote_request(self_clone.inner.clone());
                     self_clone.persist().await.expect("failed to persist");
                 })
-                    .detach();
+                .detach();
             }
             sleep(Duration::from_millis(rand::rng().gen_range(50..350))).await;
         }
@@ -332,7 +332,7 @@ impl RaftHandle {
     async fn append_entries_ticker(&self) {
         loop {
             if self.inner.lock().unwrap().state.role != Role::Leader {
-                sleep(Duration::from(APPEND_ENTRIES_INTERVAL)).await;
+                sleep(Duration::from(RECHECK_INTERVAL)).await;
                 continue;
             }
             let self_clone = self.clone();
@@ -346,7 +346,7 @@ impl RaftHandle {
                     self_clone.persist().await.expect("failed to persist");
                 }
             })
-                .detach();
+            .detach();
             sleep(Duration::from(APPEND_ENTRIES_INTERVAL)).await;
         }
     }
@@ -435,6 +435,10 @@ impl Raft {
                 data: self.state.log.get(i as usize).unwrap().command.clone(),
                 index: self.state.log.get(i as usize).unwrap().start.index,
             };
+            info!(
+                "Node {} at term {} applies entry {}",
+                self.me, self.state.term, i
+            );
             self.apply_ch.unbounded_send(msg).unwrap();
             cnt += 1;
         }
@@ -462,8 +466,8 @@ impl Raft {
         let last_entry = self.state.log.last().unwrap();
         if (self.state.voted_for.is_none() || self.state.voted_for.unwrap() == args.candidate_id)
             && (last_entry.start.term < args.last_log_term
-            || (last_entry.start.term == args.last_log_term
-            && last_entry.start.index <= args.last_log_index))
+                || (last_entry.start.term == args.last_log_term
+                    && last_entry.start.index <= args.last_log_index))
         {
             self.state.voted_for = Some(args.candidate_id);
             self.reset_election_timeout();
@@ -480,6 +484,7 @@ impl Raft {
             follower_id: self.me,
             prev_log_index: args.prev_log_index,
             entries_len: args.entries.len(),
+            args_term: args.term,
             x_term: 0,
             x_index: 0,
             x_len: 0,
@@ -499,13 +504,13 @@ impl Raft {
         reply.term = self.state.term;
         if args.prev_log_index < self.state.log.len() as u64
             && (self
-            .state
-            .log
-            .get(args.prev_log_index as usize)
-            .unwrap()
-            .start
-            .term
-            == args.prev_log_term)
+                .state
+                .log
+                .get(args.prev_log_index as usize)
+                .unwrap()
+                .start
+                .term
+                == args.prev_log_term)
         {
             for (i, en) in args.entries.iter().enumerate() {
                 // check if the follower's log entries are in sync with the leader's
@@ -562,7 +567,6 @@ impl Raft {
 
     // generate random number.
     fn generate_rpc_timeout() -> Duration {
-        // see rand crate for more details
         Duration::from_millis(40)
     }
 
@@ -580,7 +584,7 @@ impl Raft {
 
         let mut rpcs = FuturesUnordered::new();
         info!(
-            "Node {} is sending RequestVote RPCs with term: {}",
+            "Node {} at term {} sends RequestVote RPCs.",
             self.me, self.state.term
         );
         for (i, &peer) in self.peers.iter().enumerate() {
@@ -596,7 +600,7 @@ impl Raft {
             });
         }
         let mut votes: i64 = 1; // self vote
-        // spawn a concurrent task
+                                // spawn a concurrent task
         let inner = arc.clone();
         task::spawn(async move {
             // handle RPC tasks in completion order
@@ -606,6 +610,10 @@ impl Raft {
                     break; // give up
                 }
                 if let Ok(resp) = res {
+                    info!(
+                        "Node {} at term {} received RequestVoteReply with term {}.",
+                        raft.me, raft.state.term, resp.term
+                    ); // Log the reply
                     if resp.term > raft.state.term {
                         raft.become_follower(resp.term);
                         break;
@@ -619,6 +627,10 @@ impl Raft {
                             && raft.state.role == Role::Candidate
                         {
                             // become leader
+                            info!(
+                                "Node {} at term {} becomes the leader.",
+                                raft.me, raft.state.term
+                            );
                             raft.become_leader();
                             // don't care about other votes
                             break;
@@ -629,7 +641,7 @@ impl Raft {
                 }
             }
         })
-            .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
+        .detach(); // NOTE: you need to detach a task explicitly, or it will be cancelled on drop
     }
 
     fn send_append_entries(&mut self, arc: Arc<Mutex<Raft>>) {
@@ -662,7 +674,13 @@ impl Raft {
                 entries,
                 leader_commit: self.state.commit_index,
             };
-
+            info!(
+                "Node {} at term {} sends AppendEntries RPC to peer {}. Entries' len is {} ",
+                self.me,
+                term,
+                peer,
+                args.entries.len()
+            ); // Log sending AppendEntries
             rpcs.push(async move {
                 net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout)
                     .await
@@ -677,7 +695,11 @@ impl Raft {
                     break; // give up
                 }
                 if let Ok(resp) = res {
+                    if resp.args_term != raft.state.term {
+                        break
+                    }
                     if resp.success {
+                        info!("Node {} at term {} receives AppendEntriesReply from peer {}: success: {}. ", raft.me, raft.state.term, resp.follower_id, resp.success); // Log the AppendEntries reply
                         raft.state.match_index[resp.follower_id] = max(
                             raft.state.match_index[resp.follower_id],
                             resp.prev_log_index + resp.entries_len as u64,
@@ -686,11 +708,12 @@ impl Raft {
                             raft.state.next_index[resp.follower_id],
                             raft.state.match_index[resp.follower_id] + 1,
                         );
-                        let quorum = raft.get_quorum_index(); // todo: is this right?
+                        let quorum = raft.get_quorum_index();
                         if quorum > raft.state.commit_index
                             && raft.state.log.get(quorum as usize).unwrap().start.term
                             == raft.state.term
                         {
+                            info!("Node {} at term {} advances commit index from {} to {}, match index are {:?}", raft.me, raft.state.term, raft.state.commit_index, quorum, raft.state.match_index);
                             raft.state.commit_index = quorum;
                             // ok to commit new entries
                             raft.apply();
@@ -701,6 +724,8 @@ impl Raft {
                             break;
                         }
                         // decrement next_index and wait for next AppendEntries
+                        // the following line is too slow!
+                        // raft.state.next_index[resp.follower_id] = max(1, raft.state.next_index[resp.follower_id]-1);
                         if resp.x_term == INVALID_X_TERM {
                             // Case 3: follower's log is too short, then nextIndex = XLen
                             raft.state.next_index[resp.follower_id] = max(1, resp.x_len as u64);
@@ -750,9 +775,12 @@ struct AppendEntriesArgs {
 struct AppendEntriesReply {
     term: u64,
     success: bool,
+    // the following three fields can be optimized someday...
     follower_id: usize,
     prev_log_index: u64,
     entries_len: usize,
+    args_term: u64,
+    // for quick rollback matchIndex and nextIndex
     x_term: u64,
     x_index: u64,
     x_len: usize,
