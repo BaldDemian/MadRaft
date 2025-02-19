@@ -15,7 +15,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.70.0
           components: rustfmt, clippy
       - name: Check code format
         uses: actions-rs/cargo@v1
@@ -34,7 +34,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.70.0
       - uses: actions/checkout@v2
       - name: Build
         uses: actions-rs/cargo@v1
