@@ -21,9 +21,6 @@ pub struct RaftHandle {
 type MsgSender = mpsc::UnboundedSender<ApplyMsg>;
 pub type MsgRecver = mpsc::UnboundedReceiver<ApplyMsg>;
 
-/// As each Raft peer becomes aware that successive log entries are committed,
-/// the peer should send an `ApplyMsg` to the service (or tester) on the same
-/// server, via the `apply_ch` passed to `Raft::new`.
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
@@ -74,13 +71,11 @@ struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
     apply_ch: MsgSender,
-
-    // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
     election_timeout_start: Instant,
     election_timeout_duration: Duration,
     state: State,
+    log: Vec<LogEntry>,
+    snapshot: Vec<u8>,
 }
 
 /// State of a raft peer.
@@ -89,7 +84,8 @@ struct State {
     // non-volatile states
     term: u64,
     voted_for: Option<usize>,
-    log: Vec<LogEntry>,
+    last_included_index: u64,
+    last_included_term: u64,
     // volatile states
     role: Role,
     commit_index: u64,
@@ -124,6 +120,8 @@ struct Persist {
     term: u64,
     voted_for: Option<usize>,
     log: Vec<LogEntry>,
+    last_included_index: u64,
+    last_included_term: u64,
 }
 
 impl fmt::Debug for Raft {
@@ -143,8 +141,10 @@ impl RaftHandle {
             election_timeout_start: Instant::now(),
             election_timeout_duration: Default::default(),
             state: State::default(),
+            log: vec![],
+            snapshot: vec![],
         }));
-        inner.lock().unwrap().state.log.push(LogEntry::default()); // add a sentinel
+        inner.lock().unwrap().log.push(LogEntry::default()); // add a sentinel
         inner.lock().unwrap().reset_election_timeout();
         let handle = RaftHandle { inner };
         // initialize from state persisted before a crash
@@ -201,8 +201,14 @@ impl RaftHandle {
         last_included_index: u64,
         snapshot: &[u8],
     ) -> bool {
-        // todo: snapshot
-        false
+        let raft = self.inner.lock().unwrap();
+        if last_included_index < raft.state.last_included_index {
+            return false;
+        }
+        if last_included_index >= raft.get_real_log_len() as u64 {
+            return false;
+        }
+        true
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -210,8 +216,51 @@ impl RaftHandle {
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
     pub async fn snapshot(&self, index: u64, snapshot: &[u8]) -> Result<()> {
-        // todo: snapshot!
-        todo!()
+        let res = Ok(());
+        {
+            let mut raft = self.inner.lock().unwrap();
+            if index <= raft.state.last_included_index {
+                return res;
+            }
+            if index > raft.get_real_log_len() as u64 {
+                return res;
+            }
+            if index > raft.state.commit_index {
+                return res;
+            }
+            info!(
+                "Server {} at term {} gets snapshot from the service with index {}",
+                raft.me, raft.state.term, index
+            );
+            raft.snapshot = snapshot.to_vec();
+            let mut tmp = vec![];
+            tmp.push(LogEntry {
+                start: Start {
+                    index,
+                    term: raft
+                        .log
+                        .get(raft.get_local_index(index) as usize)
+                        .unwrap()
+                        .start
+                        .term,
+                },
+                command: vec![],
+            });
+            tmp.extend_from_slice(&raft.log[raft.get_local_index(index) as usize + 1..]);
+            raft.log = tmp;
+            if raft.log.len() == 0 {
+                panic!("1")
+            }
+            raft.state.last_included_index = index;
+            raft.state.last_included_term = raft
+                .log
+                .get(raft.get_local_index(index) as usize)
+                .unwrap()
+                .start
+                .term;
+        }
+        self.persist().await.expect("failed to persist");
+        res
     }
 
     /// save Raft's persistent state to stable storage,
@@ -223,9 +272,11 @@ impl RaftHandle {
             let persist: Persist = Persist {
                 term: raft.state.term,
                 voted_for: raft.state.voted_for,
-                log: raft.state.log.clone(),
+                log: raft.log.clone(),
+                last_included_index: raft.state.last_included_index,
+                last_included_term: raft.state.last_included_term,
             };
-            let snapshot: Vec<u8> = Vec::default(); // todo: snapshot
+            let snapshot: Vec<u8> = raft.snapshot.clone();
             (bincode::serialize(&persist).unwrap(), snapshot)
         };
         // you need to store persistent state in file "state"
@@ -247,7 +298,8 @@ impl RaftHandle {
     async fn restore(&self) -> io::Result<()> {
         match fs::read("snapshot").await {
             Ok(snapshot) => {
-                // todo: snapshot
+                let mut raft = self.inner.lock().unwrap();
+                raft.snapshot = snapshot.clone();
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -258,11 +310,16 @@ impl RaftHandle {
                 let mut raft = self.inner.lock().unwrap();
                 raft.state.term = persist.term;
                 raft.state.voted_for = persist.voted_for;
-                raft.state.log = persist.log.clone();
+                raft.log = persist.log.clone();
+                raft.state.last_included_index = persist.last_included_index;
+                raft.state.last_included_term = persist.last_included_term;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        let mut raft = self.inner.lock().unwrap();
+        raft.state.last_applied = max(raft.state.last_applied, raft.state.last_included_index);
+        raft.state.commit_index = max(raft.state.commit_index, raft.state.last_included_index);
         Ok(())
     }
 
@@ -280,6 +337,12 @@ impl RaftHandle {
         net.add_rpc_handler(move |args: AppendEntriesArgs| {
             let this = this.clone();
             async move { this.append_entries(args).await.unwrap() }
+        });
+
+        let this = self.clone();
+        net.add_rpc_handler(move |args: InstallSnapshotArgs| {
+            let this = this.clone();
+            async move { this.install_entries(args).await.unwrap() }
         });
         // add more RPC handlers here
     }
@@ -303,8 +366,15 @@ impl RaftHandle {
         self.persist().await.expect("failed to persist");
         Ok(reply)
     }
+    async fn install_entries(&self, args: InstallSnapshotArgs) -> Result<InstallSnapshotReply> {
+        let reply = {
+            let mut this = self.inner.lock().unwrap();
+            this.install_snapshot(args)
+        };
+        self.persist().await.expect("failed to persist");
+        Ok(reply)
+    }
 
-    // todo: fix
     async fn election_ticker(&self) {
         loop {
             let ok = {
@@ -369,12 +439,21 @@ impl Raft {
         // only a candidate can become a leader
         self.state.role = Role::Leader;
         // init next_index and match_index everytime elected as a leader
-        self.state.next_index = vec![self.state.log.len() as u64; self.peers.len()];
+        self.state.next_index = vec![self.get_real_log_len() as u64; self.peers.len()];
         self.state.match_index = vec![0; self.peers.len()];
+    }
+    fn get_local_index(&self, index: u64) -> u64 {
+        if index < self.state.last_included_index {
+            panic!()
+        }
+        index - self.state.last_included_index
+    }
+    fn get_real_log_len(&self) -> usize {
+        self.log.len() + self.state.last_included_index as usize
     }
     fn get_first_index(&self, term: u64) -> u64 {
         // get the first entry's index with the given term
-        for (_, en) in self.state.log.iter().enumerate() {
+        for (_, en) in self.log.iter().enumerate() {
             if en.start.term == term {
                 return en.start.index;
             }
@@ -384,7 +463,7 @@ impl Raft {
     fn get_last_index(&self, term: u64) -> u64 {
         // get the last entry's index with the given term
         let mut ans = INVALID_X_INDEX;
-        for (_, en) in self.state.log.iter().enumerate() {
+        for (_, en) in self.log.iter().enumerate() {
             if en.start.term == term {
                 ans = en.start.index;
             }
@@ -413,36 +492,64 @@ impl Raft {
             return Err(Error::NotLeader(leader));
         }
         let start = Start {
-            index: self.state.log.len() as u64,
+            index: self.get_real_log_len() as u64,
             term: self.state.term,
         };
-        self.state.log.push(LogEntry {
+        self.log.push(LogEntry {
             start,
             command: data.to_vec(),
         });
+        info!(
+            "Server {} at term {} gets a new command {} from the service",
+            self.me,
+            self.state.term,
+            self.get_real_log_len()
+        );
         Ok(start)
     }
 
     // apply committed message.
-    fn apply(&mut self) {
+    fn apply_entries(&mut self) {
         let mut cnt = 0;
         // commit log[last_applied+1, commit_index]
         for i in self.state.last_applied + 1..=self.state.commit_index {
-            if i >= self.state.log.len() as u64 {
+            if i >= self.get_real_log_len() as u64 {
                 break;
             }
+            if i < self.state.last_included_index {
+                continue;
+            }
+            let local_index = self.get_local_index(i);
+            if local_index == 0 {
+                continue;
+            }
             let msg = ApplyMsg::Command {
-                data: self.state.log.get(i as usize).unwrap().command.clone(),
-                index: self.state.log.get(i as usize).unwrap().start.index,
+                data: self.log.get(local_index as usize).unwrap().command.clone(),
+                index: self.log.get(local_index as usize).unwrap().start.index,
             };
             info!(
-                "Node {} at term {} applies entry {}",
+                "Server {} at term {} applies entry {}",
                 self.me, self.state.term, i
             );
             self.apply_ch.unbounded_send(msg).unwrap();
             cnt += 1;
         }
         self.state.last_applied += cnt;
+    }
+
+    fn apply_snapshot(&mut self) {
+        let msg = ApplyMsg::Snapshot {
+            data: self.snapshot.clone(),
+            term: self.state.last_included_term,
+            index: self.state.last_included_index,
+        };
+        info!(
+            "Server {} at term {} applies snapshot {}",
+            self.me, self.state.term, self.state.last_included_index
+        );
+        self.state.last_applied = max(self.state.last_applied, self.state.last_included_index);
+        self.state.commit_index = max(self.state.commit_index, self.state.last_included_index);
+        self.apply_ch.unbounded_send(msg).unwrap();
     }
 
     // true RPC handlers
@@ -460,17 +567,17 @@ impl Raft {
         if args.term > self.state.term {
             self.become_follower(args.term)
         }
+        self.reset_election_timeout();
         // now the term is aligned
         // if votedFor is null or candidate_id, and candidate's log is at
         // least as up-to-date as receiver's log, grant vote
-        let last_entry = self.state.log.last().unwrap();
+        let last_entry = self.log.last().unwrap();
         if (self.state.voted_for.is_none() || self.state.voted_for.unwrap() == args.candidate_id)
             && (last_entry.start.term < args.last_log_term
                 || (last_entry.start.term == args.last_log_term
                     && last_entry.start.index <= args.last_log_index))
         {
             self.state.voted_for = Some(args.candidate_id);
-            self.reset_election_timeout();
             reply.vote_granted = true;
             reply.term = self.state.term;
         }
@@ -502,11 +609,13 @@ impl Raft {
         // receive a heartbeat from the current leader, ok to reset the election timer
         self.reset_election_timeout();
         reply.term = self.state.term;
-        if args.prev_log_index < self.state.log.len() as u64
+        if args.prev_log_index < self.state.last_included_index {
+            return reply;
+        }
+        if args.prev_log_index < self.get_real_log_len() as u64
             && (self
-                .state
                 .log
-                .get(args.prev_log_index as usize)
+                .get(self.get_local_index(args.prev_log_index) as usize)
                 .unwrap()
                 .start
                 .term
@@ -514,19 +623,19 @@ impl Raft {
         {
             for (i, en) in args.entries.iter().enumerate() {
                 // check if the follower's log entries are in sync with the leader's
-                let idx = args.prev_log_index + 1 + i as u64;
-                if idx < self.state.log.len() as u64
-                    && en.start.term != self.state.log.get(idx as usize).unwrap().start.term
+                let idx = self.get_local_index(args.prev_log_index) + 1 + i as u64;
+                if idx < self.log.len() as u64
+                    && en.start.term != self.log.get(idx as usize).unwrap().start.term
                 {
                     // delete the conflicting one and entries following that
-                    self.state.log.truncate(idx as usize);
+                    self.log.truncate(idx as usize);
                 }
                 // case 1: in sync
                 // case 2: no this entry at all
                 // case 3: the above if stmt is executed and the log is truncated
                 // for case 2 and case 3, we know idx >= len(rf.Log) is true, so we append this entry
-                if idx >= self.state.log.len() as u64 {
-                    self.state.log.push(en.clone());
+                if idx >= self.log.len() as u64 {
+                    self.log.push(en.clone());
                 }
                 // for case 1, we do nothing, since the entries are already in sync
             }
@@ -534,7 +643,7 @@ impl Raft {
             if args.leader_commit > self.state.commit_index {
                 let tmp = self.state.commit_index;
                 if args.entries.len() == 0 {
-                    self.state.commit_index = args.leader_commit;
+                    self.state.commit_index = max(self.state.commit_index, args.leader_commit);
                 } else {
                     self.state.commit_index = max(
                         self.state.commit_index,
@@ -542,17 +651,16 @@ impl Raft {
                     );
                 }
                 if self.state.commit_index > tmp {
-                    self.apply();
+                    self.apply_entries();
                 }
             }
             reply.success = true;
         } else {
             reply.success = false;
-            if args.prev_log_index < self.state.log.len() as u64 {
+            if args.prev_log_index < self.get_real_log_len() as u64 {
                 reply.x_term = self
-                    .state
                     .log
-                    .get(args.prev_log_index as usize)
+                    .get(self.get_local_index(args.prev_log_index) as usize)
                     .unwrap()
                     .start
                     .term;
@@ -560,8 +668,68 @@ impl Raft {
                 reply.x_term = INVALID_X_TERM
             }
             reply.x_index = self.get_first_index(args.prev_log_term);
-            reply.x_len = self.state.log.len();
+            reply.x_len = self.get_real_log_len();
         }
+        reply
+    }
+
+    fn install_snapshot(&mut self, args: InstallSnapshotArgs) -> InstallSnapshotReply {
+        let mut reply = InstallSnapshotReply {
+            term: 0,
+            args_term: args.term,
+            args_last_included_index: args.last_included_index,
+            follower_id: self.me,
+        };
+        if args.term < self.state.term {
+            reply.term = self.state.term;
+            return reply;
+        }
+        if args.last_included_index <= self.state.last_included_index {
+            reply.term = self.state.term;
+            return reply;
+        }
+        self.become_follower(args.term);
+        self.reset_election_timeout();
+        reply.term = self.state.term;
+        info!(
+            "Server {} at term {} gets the snapshot with index {}",
+            self.me, self.state.term, args.last_included_index
+        );
+        // Rule5: save snapshot file, discard any existing or partial snapshot with a smaller index
+        self.snapshot = args.data;
+        // Rule6: If existing log entry has same index and term as snapshot’s
+        // last included entry, retain log entries following it and reply
+        let local_index = self.get_local_index(args.last_included_index);
+        self.state.last_included_term = args.last_included_term;
+        self.state.last_included_index = args.last_included_index;
+        if local_index < self.log.len() as u64
+            && self.log.get(local_index as usize).unwrap().start.term == args.last_included_term
+        {
+            // todo: should we add the sentinel?
+            let mut tmp = vec![];
+            tmp.push(LogEntry {
+                start: Start {
+                    index: self.state.last_included_index,
+                    term: self.state.last_included_term,
+                },
+                command: vec![],
+            });
+            tmp.extend_from_slice(&self.log[local_index as usize + 1..]);
+            self.log = tmp;
+            self.apply_snapshot();
+            return reply;
+        }
+        // Rule7: discard all log
+        self.log = vec![];
+        // still we need a sentinel
+        self.log.push(LogEntry {
+            start: Start {
+                index: self.state.last_included_index,
+                term: self.state.last_included_term,
+            },
+            command: vec![], // nil
+        });
+        self.apply_snapshot();
         reply
     }
 
@@ -576,17 +744,13 @@ impl Raft {
         let args: RequestVoteArgs = RequestVoteArgs {
             term: self.state.term,
             candidate_id: self.me,
-            last_log_index: self.state.log.last().unwrap().start.index,
-            last_log_term: self.state.log.last().unwrap().start.term,
+            last_log_index: self.log.last().unwrap().start.index,
+            last_log_term: self.log.last().unwrap().start.term,
         };
         let timeout = Self::generate_rpc_timeout();
         let net = net::NetLocalHandle::current();
 
         let mut rpcs = FuturesUnordered::new();
-        info!(
-            "Node {} at term {} sends RequestVote RPCs.",
-            self.me, self.state.term
-        );
         for (i, &peer) in self.peers.iter().enumerate() {
             if i == self.me {
                 continue;
@@ -610,10 +774,6 @@ impl Raft {
                     break; // give up
                 }
                 if let Ok(resp) = res {
-                    info!(
-                        "Node {} at term {} received RequestVoteReply with term {}.",
-                        raft.me, raft.state.term, resp.term
-                    ); // Log the reply
                     if resp.term > raft.state.term {
                         raft.become_follower(resp.term);
                         break;
@@ -647,59 +807,74 @@ impl Raft {
     fn send_append_entries(&mut self, arc: Arc<Mutex<Raft>>) {
         let timeout = Self::generate_rpc_timeout();
         let net = net::NetLocalHandle::current();
-        let mut rpcs = FuturesUnordered::new();
+        let mut append_entries_rpcs = FuturesUnordered::new();
+        let mut install_snapshot_rpcs = FuturesUnordered::new();
         let term = self.state.term;
         for (i, &peer) in self.peers.iter().enumerate() {
-            if self.state.role != Role::Leader {
+            if self.state.role != Role::Leader || term != self.state.term {
                 return;
             }
             if i == self.me {
-                self.state.match_index[i] = self.state.log.last().unwrap().start.index;
-                self.state.next_index[i] = self.state.log.last().unwrap().start.index + 1;
+                self.state.match_index[i] = self.get_real_log_len() as u64 - 1;
+                self.state.next_index[i] = self.get_real_log_len() as u64;
                 continue;
             }
             // if last log index >= next_index for a follower: send
             // AppendEntries RPC with log entries starting at nextIndex
             let pre_index = max(0, self.state.next_index[i] - 1);
-            let mut entries: Vec<LogEntry> = vec![];
-            if self.state.log.last().unwrap().start.index >= self.state.next_index[i] {
-                entries.extend_from_slice(&self.state.log[pre_index as usize + 1..]);
-            }
-            let net = net.clone();
-            let args: AppendEntriesArgs = AppendEntriesArgs {
-                term,
-                leader_id: self.me,
-                prev_log_index: pre_index,
-                prev_log_term: self.state.log.get(pre_index as usize).unwrap().start.term,
-                entries,
-                leader_commit: self.state.commit_index,
-            };
-            info!(
-                "Node {} at term {} sends AppendEntries RPC to peer {}. Entries' len is {} ",
-                self.me,
-                term,
-                peer,
-                args.entries.len()
-            ); // Log sending AppendEntries
-            rpcs.push(async move {
-                net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout)
+            if pre_index < self.state.last_included_index {
+                // PartD: if a follower falls so far behind that
+                // the leader has discarded the log entries it needs to catch up,
+                // the leader must then send a snapshot plus the log starting at the time of the snapshot
+                let net = net.clone();
+                let args: InstallSnapshotArgs = InstallSnapshotArgs {
+                    term,
+                    leader_id: self.me,
+                    last_included_index: self.state.last_included_index,
+                    last_included_term: self.state.last_included_term,
+                    data: self.snapshot.clone(),
+                };
+                install_snapshot_rpcs.push(async move {
+                    net.call_timeout::<InstallSnapshotArgs, InstallSnapshotReply>(
+                        peer, args, timeout,
+                    )
                     .await
-            });
+                });
+            } else {
+                // pre_index >= self.state.last_included_index
+                let mut entries: Vec<LogEntry> = vec![];
+                let local_index = self.get_local_index(pre_index);
+                if self.log.last().unwrap().start.index >= self.state.next_index[i] {
+                    entries.extend_from_slice(&self.log[local_index as usize + 1..]);
+                }
+                let net = net.clone();
+                let args: AppendEntriesArgs = AppendEntriesArgs {
+                    term,
+                    leader_id: self.me,
+                    prev_log_index: pre_index,
+                    prev_log_term: self.log.get(local_index as usize).unwrap().start.term,
+                    entries,
+                    leader_commit: self.state.commit_index,
+                };
+                append_entries_rpcs.push(async move {
+                    net.call_timeout::<AppendEntriesArgs, AppendEntriesReply>(peer, args, timeout)
+                        .await
+                });
+            }
         }
         // leader handles AppendEntriesReply
         let inner = arc.clone();
         task::spawn(async move {
-            while let Some(res) = rpcs.next().await {
+            while let Some(res) = append_entries_rpcs.next().await {
                 let mut raft = inner.lock().unwrap(); // this is the latest info
                 if raft.state.role != Role::Leader {
                     break; // give up
                 }
                 if let Ok(resp) = res {
                     if resp.args_term != raft.state.term {
-                        break
+                        continue;
                     }
                     if resp.success {
-                        info!("Node {} at term {} receives AppendEntriesReply from peer {}: success: {}. ", raft.me, raft.state.term, resp.follower_id, resp.success); // Log the AppendEntries reply
                         raft.state.match_index[resp.follower_id] = max(
                             raft.state.match_index[resp.follower_id],
                             resp.prev_log_index + resp.entries_len as u64,
@@ -709,14 +884,25 @@ impl Raft {
                             raft.state.match_index[resp.follower_id] + 1,
                         );
                         let quorum = raft.get_quorum_index();
+                        if quorum < raft.state.last_included_index {
+                            continue;
+                        }
+                        let local_quorum_index = raft.get_local_index(quorum);
+                        if local_quorum_index >= raft.log.len() as u64 {
+                            continue;
+                        }
                         if quorum > raft.state.commit_index
-                            && raft.state.log.get(quorum as usize).unwrap().start.term
-                            == raft.state.term
+                            && raft
+                                .log
+                                .get(local_quorum_index as usize)
+                                .unwrap()
+                                .start
+                                .term
+                                == raft.state.term
                         {
-                            info!("Node {} at term {} advances commit index from {} to {}, match index are {:?}", raft.me, raft.state.term, raft.state.commit_index, quorum, raft.state.match_index);
-                            raft.state.commit_index = quorum;
+                            raft.state.commit_index = max(raft.state.commit_index, quorum);
                             // ok to commit new entries
-                            raft.apply();
+                            raft.apply_entries();
                         }
                     } else {
                         if resp.term > raft.state.term {
@@ -743,7 +929,28 @@ impl Raft {
                 }
             }
         })
-            .detach();
+        .detach();
+        let inner = arc.clone();
+        task::spawn(async move {
+            while let Some(res) = install_snapshot_rpcs.next().await {
+                let mut raft = inner.lock().unwrap();
+                if raft.state.role != Role::Leader {
+                    break; // give up
+                }
+                if let Ok(resp) = res {
+                    if resp.args_term != raft.state.term {
+                        continue;
+                    }
+                    if resp.term > raft.state.term {
+                        raft.become_follower(resp.term);
+                        break;
+                    }
+                    raft.state.match_index[resp.follower_id] = resp.args_last_included_index;
+                    raft.state.next_index[resp.follower_id] = resp.args_last_included_index + 1;
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -784,4 +991,22 @@ struct AppendEntriesReply {
     x_term: u64,
     x_index: u64,
     x_len: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstallSnapshotArgs {
+    term: u64,
+    leader_id: usize,
+    last_included_index: u64,
+    last_included_term: u64,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstallSnapshotReply {
+    term: u64,
+    // the following two could be optimized...
+    args_term: u64,
+    args_last_included_index: u64,
+    follower_id: usize,
 }
