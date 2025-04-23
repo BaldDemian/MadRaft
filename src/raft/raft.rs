@@ -204,14 +204,7 @@ impl RaftHandle {
         last_included_index: u64,
         _snapshot: &[u8],
     ) -> bool {
-        let raft = self.inner.lock().unwrap();
-        if last_included_index < raft.state.last_included_index {
-            return false;
-        }
-        if last_included_index >= raft.get_real_log_len() as u64 {
-            return false;
-        }
-        true
+        self.inner.lock().unwrap().state.last_included_index <= last_included_index
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -223,12 +216,6 @@ impl RaftHandle {
         {
             let mut raft = self.inner.lock().unwrap();
             if index <= raft.state.last_included_index {
-                return res;
-            }
-            if index > raft.get_real_log_len() as u64 {
-                return res;
-            }
-            if index > raft.state.commit_index {
                 return res;
             }
             info!(
@@ -252,7 +239,7 @@ impl RaftHandle {
             tmp.extend_from_slice(&raft.log[raft.get_local_index(index) as usize + 1..]);
             raft.log = tmp;
             if raft.log.len() == 0 {
-                panic!("1")
+                panic!("")
             }
             raft.state.last_included_index = index;
             raft.state.last_included_term = raft
