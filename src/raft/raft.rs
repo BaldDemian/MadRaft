@@ -26,7 +26,6 @@ pub enum ApplyMsg {
         data: Vec<u8>,
         index: u64,
     },
-    // For 2D:
     Snapshot {
         data: Vec<u8>,
         term: u64,
@@ -42,7 +41,6 @@ const ELECTION_TIMEOUT_MAX_DURATION_MILLIS: u64 = 400;
 const APPEND_ENTRIES_INTERVAL: Duration = Duration::from_millis(100);
 const RECHECK_INTERVAL: Duration = Duration::from_millis(50);
 
-// log entry struct
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct LogEntry {
     start: Start,
@@ -70,6 +68,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 struct Raft {
     peers: Vec<SocketAddr>,
     me: usize,
+    leader_id: Option<usize>,
     apply_ch: MsgSender,
     election_timeout_start: Instant,
     election_timeout_duration: Duration,
@@ -130,13 +129,14 @@ impl fmt::Debug for Raft {
     }
 }
 
-// HINT: put async functions here
+// Async functions
 impl RaftHandle {
     pub async fn new(peers: Vec<SocketAddr>, me: usize) -> (Self, MsgRecver) {
         let (apply_ch, recver) = mpsc::unbounded();
         let inner = Arc::new(Mutex::new(Raft {
             peers,
             me,
+            leader_id: None,
             apply_ch,
             election_timeout_start: Instant::now(),
             election_timeout_duration: Default::default(),
@@ -175,7 +175,10 @@ impl RaftHandle {
             let mut raft = self.inner.lock().unwrap();
             raft.start(cmd)
         };
-        self.persist().await.expect("failed to persist");
+        if let Ok(_) = res {
+            // Note: `_` won't take ownership of res!
+            self.persist().await.expect("failed to persist");
+        }
         res
     }
 
@@ -197,9 +200,9 @@ impl RaftHandle {
     /// the snapshot on `apply_ch`.
     pub async fn cond_install_snapshot(
         &self,
-        last_included_term: u64,
+        _last_included_term: u64,
         last_included_index: u64,
-        snapshot: &[u8],
+        _snapshot: &[u8],
     ) -> bool {
         let raft = self.inner.lock().unwrap();
         if last_included_index < raft.state.last_included_index {
@@ -422,13 +425,14 @@ impl RaftHandle {
     }
 }
 
-// HINT: put mutable non-async functions here
+// Non-async functions. Note: a non-sync function can never call a sync function
 impl Raft {
-    fn become_follower(&mut self, term: u64) {
+    fn become_follower(&mut self, term: u64, leader_id: Option<usize>) {
         self.state.role = Role::Follower;
         self.state.term = term;
         self.state.voted_for = None;
         // we will persist states in async methods
+        self.leader_id = leader_id;
     }
     fn become_candidate(&mut self) {
         self.state.role = Role::Candidate;
@@ -441,6 +445,7 @@ impl Raft {
         // init next_index and match_index everytime elected as a leader
         self.state.next_index = vec![self.get_real_log_len() as u64; self.peers.len()];
         self.state.match_index = vec![0; self.peers.len()];
+        self.leader_id = Some(self.me);
     }
     fn get_local_index(&self, index: u64) -> u64 {
         if index < self.state.last_included_index {
@@ -488,7 +493,10 @@ impl Raft {
 
     fn start(&mut self, data: &[u8]) -> Result<Start> {
         if !self.state.is_leader() {
-            let leader = (self.me + 1) % self.peers.len();
+            let mut leader = (self.me + 1) % self.peers.len();
+            if let Some(leader_id) = self.leader_id {
+                leader = leader_id
+            }
             return Err(Error::NotLeader(leader));
         }
         let start = Start {
@@ -565,7 +573,7 @@ impl Raft {
         }
         // become follower when seeing a higher term
         if args.term > self.state.term {
-            self.become_follower(args.term)
+            self.become_follower(args.term, None); // This is only a candidate, not yet a leader
         }
         self.reset_election_timeout();
         // now the term is aligned
@@ -604,7 +612,7 @@ impl Raft {
         }
         // become follower when seeing a higher term
         if args.term >= self.state.term {
-            self.become_follower(args.term)
+            self.become_follower(args.term, Some(args.leader_id))
         }
         // receive a heartbeat from the current leader, ok to reset the election timer
         self.reset_election_timeout();
@@ -688,7 +696,7 @@ impl Raft {
             reply.term = self.state.term;
             return reply;
         }
-        self.become_follower(args.term);
+        self.become_follower(args.term, Some(args.leader_id));
         self.reset_election_timeout();
         reply.term = self.state.term;
         info!(
@@ -775,7 +783,7 @@ impl Raft {
                 }
                 if let Ok(resp) = res {
                     if resp.term > raft.state.term {
-                        raft.become_follower(resp.term);
+                        raft.become_follower(resp.term, None);
                         break;
                     }
                     if resp.term < raft.state.term || args.term != raft.state.term {
@@ -906,7 +914,7 @@ impl Raft {
                         }
                     } else {
                         if resp.term > raft.state.term {
-                            raft.become_follower(resp.term);
+                            raft.become_follower(resp.term, None);
                             break;
                         }
                         // decrement next_index and wait for next AppendEntries
@@ -942,7 +950,7 @@ impl Raft {
                         continue;
                     }
                     if resp.term > raft.state.term {
-                        raft.become_follower(resp.term);
+                        raft.become_follower(resp.term, None);
                         break;
                     }
                     raft.state.match_index[resp.follower_id] = resp.args_last_included_index;
