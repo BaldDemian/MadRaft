@@ -266,7 +266,7 @@ impl RaftHandle {
     /// see paper's Figure 2 for a description of what should be persistent.
     async fn persist(&self) -> io::Result<()> {
         let (state, snapshot) = {
-            let raft = self.inner.lock().unwrap();
+            let mut raft = self.inner.lock().unwrap();
             let persist: Persist = Persist {
                 term: raft.state.term,
                 voted_for: raft.state.voted_for,
