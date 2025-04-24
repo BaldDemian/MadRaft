@@ -74,6 +74,7 @@ struct Raft {
     election_timeout_duration: Duration,
     state: State,
     log: Vec<LogEntry>,
+    raft_state_size: usize,
     snapshot: Vec<u8>,
 }
 
@@ -142,6 +143,7 @@ impl RaftHandle {
             election_timeout_duration: Default::default(),
             state: State::default(),
             log: vec![],
+            raft_state_size: 0,
             snapshot: vec![],
         }));
         inner.lock().unwrap().log.push(LogEntry::default()); // add a sentinel
@@ -192,6 +194,12 @@ impl RaftHandle {
     pub fn is_leader(&self) -> bool {
         let raft = self.inner.lock().unwrap();
         raft.state.is_leader()
+    }
+
+    /// Return the size(in bytes) of raft's persistent states(excluding snapshot) to the service.
+    pub fn raft_state_size(&self) -> usize {
+        let raft = self.inner.lock().unwrap();
+        raft.raft_state_size
     }
 
     /// A service wants to switch to snapshot.
@@ -267,7 +275,9 @@ impl RaftHandle {
                 last_included_term: raft.state.last_included_term,
             };
             let snapshot: Vec<u8> = raft.snapshot.clone();
-            (bincode::serialize(&persist).unwrap(), snapshot)
+            let res = (bincode::serialize(&persist).unwrap(), snapshot);
+            raft.raft_state_size = res.0.len();
+            res
         };
         // you need to store persistent state in file "state"
         // and store snapshot in file "snapshot".
