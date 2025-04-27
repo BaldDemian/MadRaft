@@ -231,16 +231,17 @@ impl RaftHandle {
                 raft.me, raft.state.term, index
             );
             raft.snapshot = snapshot.to_vec();
+            raft.state.last_included_term = raft
+                .log
+                .get(raft.get_local_index(index) as usize)
+                .unwrap()
+                .start
+                .term;
             let mut tmp = vec![];
             tmp.push(LogEntry {
                 start: Start {
                     index,
-                    term: raft
-                        .log
-                        .get(raft.get_local_index(index) as usize)
-                        .unwrap()
-                        .start
-                        .term,
+                    term: raft.state.last_included_term,
                 },
                 command: vec![],
             });
@@ -250,12 +251,6 @@ impl RaftHandle {
                 panic!("")
             }
             raft.state.last_included_index = index;
-            raft.state.last_included_term = raft
-                .log
-                .get(raft.get_local_index(index) as usize)
-                .unwrap()
-                .start
-                .term;
         }
         self.persist().await.expect("failed to persist");
         res
@@ -710,7 +705,6 @@ impl Raft {
         if local_index < self.log.len() as u64
             && self.log.get(local_index as usize).unwrap().start.term == args.last_included_term
         {
-            // todo: should we add the sentinel?
             let mut tmp = vec![];
             tmp.push(LogEntry {
                 start: Start {
