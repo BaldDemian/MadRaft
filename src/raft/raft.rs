@@ -599,33 +599,29 @@ impl Raft {
         // Reply false if term < self term
         if args.term < self.state.term {
             reply.term = self.state.term;
-            reply.success = false;
             return reply;
         }
         // become follower when seeing a higher term
         if args.term >= self.state.term {
-            self.become_follower(args.term, Some(args.leader_id))
+            self.become_follower(args.term, Some(args.leader_id));
         }
         // receive a heartbeat from the current leader, ok to reset the election timer
         self.reset_election_timeout();
         reply.term = self.state.term;
         if args.prev_log_index < self.state.last_included_index {
+            reply.x_term = INVALID_X_TERM;
+            reply.x_index = self.get_real_log_len() as u64;
+            reply.x_len = self.get_real_log_len();
             return reply;
         }
+        let local_idx = self.get_local_index(args.prev_log_index) as usize;
         if args.prev_log_index < self.get_real_log_len() as u64
-            && (self
-                .log
-                .get(self.get_local_index(args.prev_log_index) as usize)
-                .unwrap()
-                .start
-                .term
-                == args.prev_log_term)
+            && self.log[local_idx].start.term == args.prev_log_term
         {
             for (i, en) in args.entries.iter().enumerate() {
                 // check if the follower's log entries are in sync with the leader's
                 let idx = self.get_local_index(args.prev_log_index) + 1 + i as u64;
-                if idx < self.log.len() as u64
-                    && en.start.term != self.log.get(idx as usize).unwrap().start.term
+                if idx < self.log.len() as u64 && en.start.term != self.log[idx as usize].start.term
                 {
                     // delete the conflicting one and entries following that
                     self.log.truncate(idx as usize);
@@ -642,13 +638,12 @@ impl Raft {
             // we will persist later
             if args.leader_commit > self.state.commit_index {
                 let tmp = self.state.commit_index;
-                if args.entries.len() == 0 {
+                if args.entries.is_empty() {
                     self.state.commit_index = max(self.state.commit_index, args.leader_commit);
                 } else {
-                    self.state.commit_index = max(
-                        self.state.commit_index,
-                        min(args.leader_commit, args.entries.last().unwrap().start.index),
-                    );
+                    let last = args.entries.last().unwrap().start.index;
+                    self.state.commit_index =
+                        max(self.state.commit_index, min(args.leader_commit, last));
                 }
                 if self.state.commit_index > tmp {
                     self.apply_entries();
@@ -657,17 +652,18 @@ impl Raft {
             reply.success = true;
         } else {
             reply.success = false;
-            if args.prev_log_index < self.get_real_log_len() as u64 {
-                reply.x_term = self
-                    .log
-                    .get(self.get_local_index(args.prev_log_index) as usize)
-                    .unwrap()
-                    .start
-                    .term;
+            let conflict_term = if args.prev_log_index < self.get_real_log_len() as u64 {
+                self.log[local_idx].start.term
             } else {
-                reply.x_term = INVALID_X_TERM
-            }
-            reply.x_index = self.get_first_index(args.prev_log_term);
+                INVALID_X_TERM
+            };
+            reply.x_term = conflict_term;
+            let first_idx = if conflict_term != INVALID_X_TERM {
+                self.get_first_index(conflict_term)
+            } else {
+                self.get_real_log_len() as u64
+            };
+            reply.x_index = first_idx;
             reply.x_len = self.get_real_log_len();
         }
         reply
