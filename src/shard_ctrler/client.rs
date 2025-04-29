@@ -1,9 +1,10 @@
 use super::msg::*;
 use crate::kvraft::client::ClerkCore;
+use crate::Request;
 use std::{collections::HashMap, net::SocketAddr};
 
 pub struct Clerk {
-    core: ClerkCore<Op, Option<Config>>,
+    core: ClerkCore<Request<Op>, Option<Config>>,
 }
 
 impl Clerk {

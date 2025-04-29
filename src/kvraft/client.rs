@@ -1,9 +1,12 @@
 use super::msg::*;
+use crate::Request;
 use madsim::{net, time::*};
+use rand::Rng;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Clerk {
-    core: ClerkCore<Op, String>,
+    core: ClerkCore<Request<Op>, String>,
 }
 
 impl Clerk {
@@ -32,9 +35,11 @@ impl Clerk {
 pub struct ClerkCore<Req, Rsp> {
     servers: Vec<SocketAddr>,
     _mark: std::marker::PhantomData<(Req, Rsp)>,
+    id: AtomicUsize,
+    seq: AtomicUsize,
 }
 
-impl<Req, Rsp> ClerkCore<Req, Rsp>
+impl<Req, Rsp> ClerkCore<Request<Req>, Rsp>
 where
     Req: net::Message + Clone,
     Rsp: net::Message,
@@ -43,21 +48,36 @@ where
         ClerkCore {
             servers,
             _mark: std::marker::PhantomData,
+            id: AtomicUsize::new(rand_usize()),
+            seq: AtomicUsize::new(1),
         }
     }
 
     pub async fn call(&self, args: Req) -> Rsp {
         let net = net::NetLocalHandle::current();
-        for i in 0..self.servers.len() {
-            let ret = net
-                .call_timeout::<Req, Result<Rsp, Error>>(
-                    self.servers[i],
-                    args.clone(),
-                    Duration::from_millis(500),
-                )
-                .await;
-            todo!("handle RPC results");
+        loop {
+            for i in 0..self.servers.len() {
+                let ret = net
+                    .call_timeout::<Request<Req>, Result<Rsp, Error>>(
+                        self.servers[i],
+                        Request {
+                            payload: args.clone(),
+                            sender: self.id.load(Ordering::Relaxed),
+                            seq: self.seq.load(Ordering::Relaxed),
+                        },
+                        Duration::from_millis(500),
+                    )
+                    .await;
+                if let Ok(Ok(resp)) = ret {
+                    self.seq.fetch_add(1, Ordering::Relaxed);
+                    return resp;
+                }
+                // keep trying forever facing all other errors: timeout, not leader...
+            }
         }
-        todo!("handle RPC results");
     }
+}
+
+pub fn rand_usize() -> usize {
+    madsim::rand::rng().gen()
 }

@@ -151,6 +151,12 @@ impl RaftHandle {
         let handle = RaftHandle { inner };
         // initialize from state persisted before a crash
         handle.restore().await.expect("failed to restore");
+        {
+            let mut raft = handle.inner.lock().unwrap();
+            if raft.state.last_included_index > 0 {
+                raft.apply_snapshot();
+            }
+        }
         handle.start_rpc_server(); // activate all RPC handlers
         let handle_clone = handle.clone();
         task::spawn(async move {

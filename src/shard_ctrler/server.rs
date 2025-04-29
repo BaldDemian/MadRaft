@@ -1,5 +1,6 @@
 use super::msg::*;
-use crate::kvraft::server::{Server, State};
+use crate::kvraft::server::Server;
+use crate::{Request, State};
 use serde::{Deserialize, Serialize};
 
 pub type ShardCtrler = Server<ShardInfo>;
@@ -10,10 +11,14 @@ pub struct ShardInfo {
 }
 
 impl State for ShardInfo {
-    type Command = Op;
+    type Command = Request<Op>;
     type Output = Option<Config>;
 
     fn apply(&mut self, cmd: Self::Command) -> Self::Output {
         todo!("apply command");
+    }
+
+    fn check_duplicate(&self, cmd: &Self::Command) -> Option<Self::Output> {
+        todo!()
     }
 }
