@@ -1,7 +1,7 @@
 use super::msg::*;
 use crate::raft::ApplyMsg;
 use crate::{raft, CommandInfo, Pair, Request, State};
-use futures::{channel::oneshot, lock::Mutex as AsyncMutex, select, FutureExt, StreamExt};
+use futures::{channel::oneshot, lock::Mutex, select, FutureExt, StreamExt};
 use madsim::net;
 use madsim::task;
 use madsim::time;
@@ -10,14 +10,14 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
 pub struct Server<S: State> {
     rf: raft::RaftHandle,
     me: usize,
-    state: Arc<AsyncMutex<S>>,
+    state: Arc<Mutex<S>>,
     max_raft_state: Option<usize>,
     notify: Arc<Mutex<HashMap<Pair, oneshot::Sender<S::Output>>>>,
 }
@@ -41,7 +41,7 @@ where
         let server = Arc::new(Server {
             rf,
             me,
-            state: Arc::new(AsyncMutex::new(S::default())),
+            state: Arc::new(Mutex::new(S::default())),
             max_raft_state,
             notify: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -64,7 +64,7 @@ where
                                 sender: cmd.sender(),
                                 seq: cmd.seq(),
                             };
-                            if let Some(tx) = server.notify.lock().unwrap().remove(&p) {
+                            if let Some(tx) = server.notify.lock().await.remove(&p) {
                                 let _ = tx.send(out.clone());
                             }
                             if let Some(max) = server.max_raft_state {
@@ -131,7 +131,7 @@ where
             seq: cmd.seq(),
         };
         let (tx, rx) = oneshot::channel();
-        self.notify.lock().unwrap().insert(p, tx);
+        self.notify.lock().await.insert(p, tx);
         let mut rx = rx.fuse();
         let mut delay = time::sleep(Duration::from_millis(20)).fuse();
         loop {
@@ -139,7 +139,7 @@ where
                 res = rx => return res.map_err(|_| Error::NotLeader { hint: 0 }),
                 _ = delay => {
                     if !self.rf.is_leader() {
-                        self.notify.lock().unwrap().remove(&p);
+                        self.notify.lock().await.remove(&p);
                         return Err(Error::NotLeader { hint: 0 });
                     }
                     delay = time::sleep(Duration::from_millis(20)).fuse();
