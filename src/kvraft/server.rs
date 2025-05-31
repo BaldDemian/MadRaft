@@ -1,11 +1,12 @@
 use super::msg::*;
 use crate::raft::ApplyMsg;
 use crate::{raft, CommandInfo, Pair, Request, State};
-use futures::{channel::oneshot, lock::Mutex, select, FutureExt, StreamExt};
+use futures::{channel::oneshot, select, FutureExt, StreamExt};
 use madsim::net;
 use madsim::task;
 use madsim::time;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
@@ -53,7 +54,7 @@ where
                         ApplyMsg::Command { data, index } => {
                             let cmd: S::Command = bincode::deserialize(&data).unwrap();
                             let out = {
-                                let mut st = server.state.lock().await;
+                                let mut st = server.state.lock().unwrap();
                                 if let Some(cached) = st.check_duplicate(&cmd) {
                                     cached
                                 } else {
@@ -64,13 +65,13 @@ where
                                 sender: cmd.sender(),
                                 seq: cmd.seq(),
                             };
-                            if let Some(tx) = server.notify.lock().await.remove(&p) {
+                            if let Some(tx) = server.notify.lock().unwrap().remove(&p) {
                                 let _ = tx.send(out.clone());
                             }
                             if let Some(max) = server.max_raft_state {
                                 if server.rf.raft_state_size() >= max {
                                     let snap = {
-                                        let st = server.state.lock().await;
+                                        let st = server.state.lock().unwrap();
                                         bincode::serialize(&*st).unwrap()
                                     };
                                     let _ = server.rf.snapshot(index, &snap).await;
@@ -83,7 +84,7 @@ where
                             index: _,
                         } => {
                             let snap: S = bincode::deserialize(&data).unwrap();
-                            let mut st = server.state.lock().await;
+                            let mut st = server.state.lock().unwrap();
                             *st = snap;
                         }
                     }
@@ -116,7 +117,7 @@ where
 
     async fn apply_rpc(&self, cmd: S::Command) -> Result<S::Output, Error> {
         if let Some(res) = {
-            let st = self.state.lock().await;
+            let st = self.state.lock().unwrap();
             st.check_duplicate(&cmd)
         } {
             return Ok(res);
@@ -131,7 +132,7 @@ where
             seq: cmd.seq(),
         };
         let (tx, rx) = oneshot::channel();
-        self.notify.lock().await.insert(p, tx);
+        self.notify.lock().unwrap().insert(p, tx);
         let mut rx = rx.fuse();
         let mut delay = time::sleep(Duration::from_millis(20)).fuse();
         loop {
@@ -139,7 +140,7 @@ where
                 res = rx => return res.map_err(|_| Error::NotLeader { hint: 0 }),
                 _ = delay => {
                     if !self.rf.is_leader() {
-                        self.notify.lock().await.remove(&p);
+                        self.notify.lock().unwrap().remove(&p);
                         return Err(Error::NotLeader { hint: 0 });
                     }
                     delay = time::sleep(Duration::from_millis(20)).fuse();
